@@ -66,25 +66,21 @@ func (t *testHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		body, _ := ioutil.ReadAll(req.Body)
 		w.Write(body)
 	case "/nothing":
-
 	}
 }
 
 func makeTestChecker(t *testing.T) *Checker {
 	handler := &testHandler{}
-	port := ":3000"
-	return New(t, handler, port)
+	return New(t, handler)
 }
 
 func TestNew(t *testing.T) {
 	handler := &testHandler{}
-	addr := ":3000"
-	checker := New(t, handler, addr)
+	checker := New(t, handler)
 
 	assert.NotNil(t, checker)
 	assert.Exactly(t, t, checker.t)
 	assert.Exactly(t, handler, checker.handler)
-	assert.Exactly(t, addr, checker.addr)
 }
 
 func TestTest(t *testing.T) {
@@ -279,7 +275,6 @@ func TestCb(t *testing.T) {
 func TestCookies(t *testing.T) {
 	mockT := new(testing.T)
 	checker := makeTestChecker(mockT)
-	checker.PersistCookie("some")
 
 	checker.Test("GET", "/cookies")
 	checker.Check()
@@ -288,14 +283,13 @@ func TestCookies(t *testing.T) {
 	checker.HasCookie("other", "secondcookie")
 	assert.False(t, mockT.Failed())
 
-	checker.Test("GET", "/nothing")
-	checker.Check()
+	checker.Test("GET", "/nothing").Check()
 
 	checker.HasCookie("some", "cookie")
 	assert.False(t, mockT.Failed())
 
 	checker.HasCookie("other", "secondcookie")
-	assert.True(t, mockT.Failed())
+	assert.False(t, mockT.Failed())
 }
 
 func TestStringBody(t *testing.T) {

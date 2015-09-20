@@ -3,14 +3,13 @@ package httpcheck
 import (
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/http/cookiejar"
+	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/braintree/manners"
 	"github.com/ivpusic/golog"
 	"github.com/stretchr/testify/assert"
 )
@@ -19,13 +18,9 @@ type (
 	Checker struct {
 		t        *testing.T
 		handler  http.Handler
-		addr     string
-		client   *http.Client
 		request  *http.Request
 		response *http.Response
-		prefix   string
-		pcookies map[string]bool
-		end      chan bool
+		cookies  map[string]string
 	}
 
 	Callback func(*http.Response)
@@ -35,55 +30,16 @@ var (
 	logger = golog.GetLogger("github.com/ivpusic/httpcheck")
 )
 
-func New(t *testing.T, handler http.Handler, addr string) *Checker {
+func New(t *testing.T, handler http.Handler) *Checker {
 	logger.Level = golog.INFO
-	prefix := ""
 
-	addrParts := strings.Split(addr, ":")
-	if addrParts[0] == "" {
-		prefix = "http://localhost" + addr
-	} else {
-		prefix = "http://" + addr
-	}
-
-	jar, _ := cookiejar.New(nil)
 	instance := &Checker{
 		t:       t,
 		handler: handler,
-		addr:    addr,
-		prefix:  prefix,
-		client: &http.Client{
-			Timeout: time.Duration(5 * time.Second),
-			Jar:     jar,
-		},
-		pcookies: map[string]bool{},
-		end:      make(chan bool),
+		cookies: map[string]string{},
 	}
 
 	return instance
-}
-
-// enables a cookie to be preserved between requests
-func (c *Checker) PersistCookie(cookie string) {
-	c.pcookies[cookie] = true
-}
-
-// the specified cookie will not be preserved during requests anymore
-func (c *Checker) UnpersistCookie(cookie string) {
-	delete(c.pcookies, cookie)
-}
-
-// Will run HTTP server
-func (c *Checker) run() {
-	logger.Debug("running server")
-	manners.ListenAndServe(c.addr, c.handler)
-	c.end <- true
-}
-
-// Will stop HTTP server
-func (c *Checker) stop() {
-	logger.Debug("stopping server")
-	manners.Close()
 }
 
 // make request /////////////////////////////////////////////////
@@ -101,21 +57,11 @@ func (c *Checker) TestRequest(request *http.Request) *Checker {
 // Prepare for testing some part of code which lives on provided path and method.
 func (c *Checker) Test(method, path string) *Checker {
 	method = strings.ToUpper(method)
-	request, err := http.NewRequest(method, c.prefix+path, nil)
+	request, err := http.NewRequest(method, path, nil)
 
 	assert.Nil(c.t, err, "Failed to make new request")
 
 	c.request = request
-	return c
-}
-
-// Final URL for request will be prefix+path.
-// Prefix can be something like "http://localhost:3000", and path can be "/some/path" for example.
-// Path is provided by user using "Test" method.
-// Library will try to figure out URL prefix automatically for you.
-// But in case that for your case is not the best, you can set prefix manually
-func (c *Checker) SetPrefix(prefix string) *Checker {
-	c.prefix = prefix
 	return c
 }
 
@@ -139,15 +85,8 @@ func (c *Checker) HasHeader(key, expectedValue string) *Checker {
 
 // Will put cookie on request
 func (c *Checker) HasCookie(key, expectedValue string) *Checker {
-	found := false
-	for _, cookie := range c.client.Jar.Cookies(c.request.URL) {
-		if cookie.Name == key && cookie.Value == expectedValue {
-			found = true
-			break
-		}
-	}
-	assert.True(c.t, found)
-
+	value, exists := c.cookies[key]
+	assert.True(c.t, exists && expectedValue == value)
 	return c
 }
 
@@ -241,43 +180,44 @@ func (c *Checker) HasString(body string) *Checker {
 	return c.HasBody([]byte(body))
 }
 
+func (c *Checker) handleCookies(r *http.Response) {
+	if header, exist := r.Header["Set-Cookie"]; exist {
+		for _, str := range header {
+			if ind := strings.Index(str, "="); ind > 0 {
+				c.cookies[str[0:ind]] = str[ind+1 : len(str)]
+			} else {
+				panic("did not find = in cookie string")
+			}
+		}
+	}
+}
+
+func (c *Checker) generateCookieString() string {
+	str := ""
+	for name, val := range c.cookies {
+		str += fmt.Sprintf("%s=%s;", name, val)
+	}
+	return str
+}
+
 // Will make reqeust to built request object.
 // After request is made, it will save response object for future assertions
 // Responsibility of this method is also to start and stop HTTP server
 func (c *Checker) Check() *Checker {
-	// start server in new goroutine
-	go c.run()
 
-	// todo: try to avoid this
-	// this is giving server enought time to start
-	time.Sleep(10)
+	// set cookies
+	c.request.Header.Set("Cookie", c.generateCookieString())
 
-	newJar, _ := cookiejar.New(nil)
+	recorder := httptest.NewRecorder()
+	c.handler.ServeHTTP(recorder, c.request)
 
-	for name, _ := range c.pcookies {
-		for _, oldCookie := range c.client.Jar.Cookies(c.request.URL) {
-			if name == oldCookie.Name {
-				newJar.SetCookies(c.request.URL, []*http.Cookie{oldCookie})
-				break
-			}
-		}
+	resp := &http.Response{
+		StatusCode: recorder.Code,
+		Body:       NewReadCloser(recorder.Body),
+		Header:     recorder.Header(),
 	}
-
-	c.client.Jar = newJar
-	response, err := c.client.Do(c.request)
-	if err != nil {
-		println(err.Error())
-		c.t.FailNow()
-	}
-
-	// assert.Nil(c.t, err, "Failed while making new request.", err)
-
-	// save response for assertion checks
-	c.response = response
-
-	// stop server
-	c.stop()
-	<-c.end
+	c.handleCookies(resp)
+	c.response = resp
 
 	return c
 }
